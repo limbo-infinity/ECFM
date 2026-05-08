@@ -68,47 +68,57 @@ class ConditionalFlow(nn.Module):
 
         return ((pred_velocity - target_velocity) ** 2).mean()
 
+## Sampler for the CFM
+class ECFMModel(nn.Module):
+    def __init__(self, T, K, hidden_dim):
+        super().__init__()
 
-## Included the penalalization of the bidding prices if they go outside of the 
-## bounds set by the prices of the day
-def trading_energy(
-    x,
-    da_price,
-    rt_price,
-    low,
-    up,
-    budget,
-    alpha=20.0,
-    penalty_weight=100.0,
-):
-    """
-    x:        [batch, T, K] generated bid decisions
-    da_price: [batch, T, K] lambda prices
-    rt_price: [batch, T, K] pi prices
-    budget: scalar or [batch, T]
-    """
+        self.T = T
+        self.K = K
+        self.v_theta = ConditionalFlow(T=T, K=K, hidden_dim=hidden_dim)
 
-    x = transform_x(x, low, up)
-    cleared_prob = torch.sigmoid(alpha * (x - da_price))
-    payoff = ((rt_price - da_price) * cleared_prob).sum(dim=(1, 2))
-    base_energy = -payoff
+    @torch.no_grad()
+    def sample(self, da_cond, rt_cond, num_samples=1, num_steps=50):
+        """
+        da_cond: [batch, T, K]
+        rt_cond: [batch, T, K]
 
-    # nonnegative_penalty = F.relu(-x).sum(dim=(1, 2))
+        returns:
+            x_candidates: [batch, num_samples, T, K]
+        """
 
-    daily_l1 = x.abs().sum(dim=-1)  # [batch, T]
-    budget_penalty = F.relu(daily_l1 - budget).sum(dim=1)
+        batch_size, T, K = da_cond.shape
+        device = da_cond.device
 
-    ## Removed the below zero penalty because the x already satisfies it
-    total_energy = base_energy + penalty_weight * (
-        + budget_penalty
-    )
+        # Repeat conditioning variables for multiple samples per input
+        da_rep = da_cond.unsqueeze(1).repeat(1, num_samples, 1, 1)
+        rt_rep = rt_cond.unsqueeze(1).repeat(1, num_samples, 1, 1)
 
-    return total_energy.mean(), {
-        "mean_payoff": payoff.mean().item(),
-        "mean_base_energy": base_energy.mean().item(),
-        "mean_budget_penalty": budget_penalty.mean().item(),
-        "mean_total_energy": total_energy.mean().item(),
-    }
+        da_rep = da_rep.reshape(batch_size * num_samples, T, K)
+        rt_rep = rt_rep.reshape(batch_size * num_samples, T, K)
+
+        # Initial noise x_0 ~ N(0, I)
+        x = torch.randn(batch_size * num_samples, T, K, device=device)
+
+        dt = 1.0 / num_steps
+
+        for step in range(num_steps):
+            t_value = step / num_steps
+            t = torch.full(
+                (batch_size * num_samples, 1),
+                t_value,
+                device=device,
+            )
+
+            velocity = self.v_theta(x, t, da_rep, rt_rep)
+
+            # Euler ODE step
+            x = x + dt * velocity
+
+        x = x.reshape(batch_size, num_samples, T, K)
+
+        return x
+
     
     
 ## Energy fn is just the trading energy from (6)
