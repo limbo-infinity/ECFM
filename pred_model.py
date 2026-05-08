@@ -42,15 +42,16 @@ def trading_energy(
     # Convert maximization of payoff into minimization
     base_energy = -payoff
 
-    # Constraint 1: x >= 0
-    nonnegative_penalty = F.relu(-x).sum(dim=(1, 2))
+    # # Constraint 1: x >= 0
+    # nonnegative_penalty = F.relu(-x).sum(dim=(1, 2))
 
     # Constraint 2: ||x_t||_1 <= B for each day t
     daily_l1 = x.abs().sum(dim=-1)  # [batch, T]
     budget_penalty = F.relu(daily_l1 - budget).sum(dim=1)
 
+    ## Removed the below zero penalty because the x already satisfies it
     total_energy = base_energy + penalty_weight * (
-        nonnegative_penalty + budget_penalty
+        + budget_penalty
     )
 
     return total_energy.mean(), {
@@ -133,19 +134,20 @@ def pred_loss(g_phi, xi, da_true, rt_true):
 ## Training Loop
 train_loss_dict = dict()
 val_loss_dict = dict()
-train_accuracy_dict = dict()
-test_accuracy_dict = dict()
+
 
 # Should this be put inside the training loop?
 for epoch in range(num_epochs):
     g_phi.train()
     epoch_total_loss = 0.0
+    num_samples = 0
 
     # Can consider adding a training progress bar later using tqdm
 
     for xi, da_true, rt_true in train_loader:
         xi = xi.to(device)
         rt_true = rt_true.to(device)
+        da_true = da_true.to(device)
 
         optimizer.zero_grad()
 
@@ -153,3 +155,14 @@ for epoch in range(num_epochs):
 
         loss.backward()
         optimizer.step()
+        
+        
+        batch_size_curr = xi.size(0)
+        epoch_loss += loss.item() * batch_size_curr
+        num_samples += batch_size_curr
+        
+        
+    avg_loss = epoch_loss / num_samples
+    train_loss_dict[epoch] = avg_loss
+    
+    print(f"Epoch {epoch + 1}/{num_epochs} | prediction loss: {avg_loss:.4f}")
