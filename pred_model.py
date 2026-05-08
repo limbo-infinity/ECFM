@@ -3,7 +3,6 @@ import torch.nn.functional as F
 import torch.nn as nn
 from helper import transform_x
 import torch.optim as optim
-import tdqm
 import matplotlib.pyplot as plt
 
 
@@ -30,7 +29,9 @@ def trading_energy(
     rt_price: [batch, T, K] pi prices
     budget: scalar or [batch, T]
     """
+    # Transform x to be within the bounds of the bidding prices
     x = transform_x(x, low, up)
+    
 
     # Smooth approximation of 1{x >= lambda}
     cleared_prob = torch.sigmoid(alpha * (x - da_price))
@@ -105,6 +106,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 g_phi = PricePredictor(obs_dim=obs_dim, hidden_dim=hidden_dim, T=T, K=K)
+g_phi.to(device) 
 print(g_phi)
 
 
@@ -113,66 +115,41 @@ optimizer = torch.optim.Adam(g_phi.parameters(), lr=learning_rate)
 
 ## Not too sure what the dims of xi are -> check this/ just change later to suit
 ## the implementation
-def pred_loss(g_phi, xi, c_true):
+def pred_loss(g_phi, xi, da_true, rt_true):
     """
     xi:       [batch, obs_dim] observations of past prices
-    c_true: [batch, 2*T*K] true RT and DA prices
+    da_true: [batch, T, K]
+    rt_true: [batch, T, K]
     g_phi: prediction model 
     """
+    da_pred, rt_pred = g_phi(xi)
 
-    c_pred = g_phi(xi)
+    loss_da = F.mse_loss(da_pred, da_true)
+    loss_rt = F.mse_loss(rt_pred, rt_true)
+    return loss_da + loss_rt 
 
-    loss = torch.norm(c_pred - c_true, p=2, dim=1) ** 2 # Get the norm across all days and options for both DA and RT
-    
-    return loss.mean()
 
-# da_pred, rt_pred = g_phi(xi)
 
 ## Training Loop
-train_loss_history = []
+train_loss_dict = dict()
+val_loss_dict = dict()
+train_accuracy_dict = dict()
+test_accuracy_dict = dict()
 
-g_phi.train()
-
+# Should this be put inside the training loop?
 for epoch in range(num_epochs):
+    g_phi.train()
     epoch_total_loss = 0.0
 
+    # Can consider adding a training progress bar later using tqdm
 
-    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
-
-    for x, _ in progress_bar:
-        x = x.to(device)
+    for xi, da_true, rt_true in train_loader:
+        xi = xi.to(device)
+        rt_true = rt_true.to(device)
 
         optimizer.zero_grad()
 
-        x_recon, mu, logvar = vae(x)
-        total_loss, recon_loss, kl_loss = vae_loss(x_recon, x, mu, logvar)
+        loss = pred_loss(g_phi, xi, da_true, rt_true)
 
-        total_loss.backward()
+        loss.backward()
         optimizer.step()
-
-        epoch_total_loss += total_loss.item()
-        epoch_recon_loss += recon_loss.item()
-        epoch_kl_loss += kl_loss.item()
-
-        # Show average losses per image so values are easier to interpret
-        batch_size_curr = x.size(0)
-        progress_bar.set_postfix(
-            total_loss=f"{total_loss.item() / batch_size_curr:.4f}",
-            recon_loss=f"{recon_loss.item() / batch_size_curr:.4f}",
-            kl_loss=f"{kl_loss.item() / batch_size_curr:.4f}",
-        )
-
-    avg_total_loss = epoch_total_loss / len(train_loader.dataset)
-    avg_recon_loss = epoch_recon_loss / len(train_loader.dataset)
-    avg_kl_loss = epoch_kl_loss / len(train_loader.dataset)
-
-    train_loss_history.append(avg_total_loss)
-    train_recon_history.append(avg_recon_loss)
-    train_kl_history.append(avg_kl_loss)
-
-    print(
-        f"Epoch {epoch + 1}/{num_epochs} | "
-        f"avg total loss: {avg_total_loss:.4f} | "
-        f"avg recon loss: {avg_recon_loss:.4f} | "
-        f"avg kl loss: {avg_kl_loss:.4f}"
-    )
