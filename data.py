@@ -101,7 +101,7 @@ def load_lbmp_csv(
                     missing.append(f"{zone} hour {hour}")
                     continue
                 values.append(daily_prices[date][key])
-
+        
         if missing:
             missing_preview = ", ".join(missing[:5])
             raise ValueError(
@@ -163,13 +163,12 @@ class VirtualTradingDataset(Dataset):
     def __getitem__(self, idx):
         target_day = self.target_indices[idx]
         latest_input_day = target_day - self.gap
-
+        
         start = latest_input_day - self.history_len + 1
         end = latest_input_day + 1
-
         hist_da = self.da_prices[start:end]
         hist_rt = self.rt_prices[start:end]
-
+        
         xi = torch.cat([hist_da, hist_rt], dim=0).reshape(-1)
         da_true = self.da_prices[target_day].unsqueeze(0)
         rt_true = self.rt_prices[target_day].unsqueeze(0)
@@ -189,10 +188,8 @@ def make_train_val_loaders(
     first_valid_t = history_len + gap - 1
     all_target_days = np.arange(first_valid_t, num_days)
     split_day = int(train_frac * num_days)
-
     train_target_days = all_target_days[all_target_days < split_day]
     val_target_days = all_target_days[all_target_days >= split_day]
-
     train_dataset = VirtualTradingDataset(
         da_prices=da_prices,
         rt_prices=rt_prices,
@@ -275,7 +272,6 @@ def main():
         zones=zones,
         include_trade_sides=args.include_trade_sides,
     )
-
     print("Loaded day-ahead prices")
     print(f"days: {metadata['num_days']}")
     print(f"zones: {metadata['num_zones']}")
