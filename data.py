@@ -1,4 +1,3 @@
-import argparse
 import csv
 import glob
 from collections import defaultdict
@@ -10,7 +9,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-TIME_FORMATS = ("%m/%d/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+TIME_FORMATS = (
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+)
 NYISO_ZONES = (
     "CAPITL",
     "CENTRL",
@@ -24,6 +28,7 @@ NYISO_ZONES = (
     "NORTH",
     "WEST",
 )
+ZONE_DATA_DIR = Path("zone_data")
 
 
 def parse_timestamp(value):
@@ -55,6 +60,7 @@ def load_lbmp_csv(
     zone_column="Name",
     zones=None,
     include_trade_sides=False,
+    dates=None,
 ):
     """
     Parse NYISO LBMP CSV files into daily price vectors.
@@ -66,6 +72,7 @@ def load_lbmp_csv(
     daily_prices = defaultdict(dict)
     seen_zones = set()
     seen_hours = set()
+    dates = set(dates) if dates is not None else None
 
     for path in expand_paths(paths):
         with open(path, newline="") as csv_file:
@@ -74,6 +81,9 @@ def load_lbmp_csv(
             for row in reader:
                 timestamp = parse_timestamp(row[timestamp_column])
                 date = timestamp.date()
+                if dates is not None and date not in dates:
+                    continue
+
                 hour = timestamp.hour
                 zone = row[zone_column].strip()
                 price = float(row[price_column])
@@ -144,7 +154,8 @@ class VirtualTradingDataset(Dataset):
             raise ValueError("da_prices and rt_prices must have the same shape.")
 
         self.num_days, self.K = self.da_prices.shape
-        first_valid_t = history_len + gap - 1
+        first_valid_t = history_len + gap - 1  ##Not sure if this is right
+        
 
         if first_valid_t >= self.num_days:
             raise ValueError(
@@ -164,6 +175,7 @@ class VirtualTradingDataset(Dataset):
         target_day = self.target_indices[idx]
         latest_input_day = target_day - self.gap
         
+        ## don't assume that we start from day 1 but rather a slice
         start = latest_input_day - self.history_len + 1
         end = latest_input_day + 1
         hist_da = self.da_prices[start:end]
@@ -185,11 +197,11 @@ def make_train_val_loaders(
     train_frac=0.8,
 ):
     num_days = da_prices.shape[0]
-    first_valid_t = history_len + gap - 1
+    first_valid_t = history_len + gap - 1 ## why are we starting from hist len + gap
     all_target_days = np.arange(first_valid_t, num_days)
-    split_day = int(train_frac * num_days)
-    train_target_days = all_target_days[all_target_days < split_day]
-    val_target_days = all_target_days[all_target_days >= split_day]
+    train_days = int(train_frac * num_days)
+    train_target_days = all_target_days[all_target_days < train_days]
+    val_target_days = all_target_days[all_target_days >= train_days]
     train_dataset = VirtualTradingDataset(
         da_prices=da_prices,
         rt_prices=rt_prices,
@@ -238,6 +250,7 @@ def load_train_val_from_csv(
         rt_paths,
         zones=da_metadata["zones"],
         include_trade_sides=include_trade_sides,
+        dates=da_metadata["dates"],
     )
 
     if da_metadata["dates"] != rt_metadata["dates"]:
@@ -254,39 +267,92 @@ def load_train_val_from_csv(
     return train_loader, val_loader, da_metadata
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Parse NYISO LBMP CSV files.")
-    parser.add_argument("da_csv", help="Day-ahead LBMP CSV path or glob.")
-    parser.add_argument("--rt-csv", help="Real-time LBMP CSV path or glob.")
-    parser.add_argument("--include-trade-sides", action="store_true")
-    parser.add_argument(
-        "--nyiso-zones-only",
-        action="store_true",
-        help="Use the 11 internal NYISO load zones and exclude external proxy zones.",
-    )
-    args = parser.parse_args()
-    zones = NYISO_ZONES if args.nyiso_zones_only else None
+def load_prices_from_zone_data(
+    zone_data_dir=ZONE_DATA_DIR,
+    include_trade_sides=False,
+    zones=NYISO_ZONES,
+):
+    zone_data_dir = Path(zone_data_dir)
+    da_paths = str(zone_data_dir / "DA" / "*.csv")
+    rt_paths = str(zone_data_dir / "RT" / "*.csv")
 
-    da_prices, metadata = load_lbmp_csv(
-        args.da_csv,
+    da_prices, da_metadata = load_lbmp_csv(
+        da_paths,
+        include_trade_sides=include_trade_sides,
         zones=zones,
-        include_trade_sides=args.include_trade_sides,
     )
-    print("Loaded day-ahead prices")
+    rt_prices, rt_metadata = load_lbmp_csv(
+        rt_paths,
+        include_trade_sides=include_trade_sides,
+        zones=da_metadata["zones"],
+        dates=da_metadata["dates"],
+    )
+
+    if da_metadata["dates"] != rt_metadata["dates"]:
+        raise ValueError("Day-ahead and real-time CSV files must cover the same dates.")
+
+    return da_prices, rt_prices, da_metadata
+
+
+def load_train_val_from_zone_data(
+    zone_data_dir=ZONE_DATA_DIR,
+    history_len=30,
+    gap=2,
+    batch_size=128,
+    train_frac=0.8,
+    include_trade_sides=False,
+    zones=NYISO_ZONES,
+):
+    da_prices, rt_prices, metadata = load_prices_from_zone_data(
+        zone_data_dir=zone_data_dir,
+        include_trade_sides=include_trade_sides,
+        zones=zones,
+    )
+    train_loader, val_loader = make_train_val_loaders(
+        da_prices=da_prices,
+        rt_prices=rt_prices,
+        history_len=history_len,
+        gap=gap,
+        batch_size=batch_size,
+        train_frac=train_frac,
+    )
+    return train_loader, val_loader, metadata
+
+
+def main():
+    history_len = 30
+    gap = 2
+    batch_size = 128
+    train_frac = 0.8
+    include_trade_sides = False
+
+    da_prices, rt_prices, metadata = load_prices_from_zone_data(
+        include_trade_sides=include_trade_sides,
+    )
+    print("Loaded prices from zone_data")
     print(f"days: {metadata['num_days']}")
     print(f"zones: {metadata['num_zones']}")
     print(f"hours/day: {metadata['hours_per_day']}")
     print(f"K: {metadata['K']}")
-    print(f"shape: {da_prices.shape}")
+    print(f"day-ahead shape: {da_prices.shape}")
+    print(f"real-time shape: {rt_prices.shape}")
 
-    if args.rt_csv:
-        rt_prices, _ = load_lbmp_csv(
-            args.rt_csv,
-            zones=metadata["zones"],
-            include_trade_sides=args.include_trade_sides,
+    try:
+        train_loader, val_loader = make_train_val_loaders(
+            da_prices=da_prices,
+            rt_prices=rt_prices,
+            history_len=history_len,
+            gap=gap,
+            batch_size=batch_size,
+            train_frac=train_frac,
         )
-        print("Loaded real-time prices")
-        print(f"shape: {rt_prices.shape}")
+    except ValueError as error:
+        print(f"Could not create training and validation sets: {error}")
+        return
+
+    print("Created training and validation sets")
+    print(f"train batches: {len(train_loader)}")
+    print(f"validation batches: {len(val_loader)}")
 
 
 if __name__ == "__main__":
