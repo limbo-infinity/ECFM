@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 TIME_FORMATS = (
     "%m/%d/%Y %H:%M",
     "%m/%d/%Y %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S",
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d %H:%M",
 )
@@ -29,6 +30,9 @@ NYISO_ZONES = (
     "WEST",
 )
 ZONE_DATA_DIR = Path("zone_data")
+TIMESTAMP_COLUMNS = ("Time Stamp", "Eastern Date Hour", "RTD End Time Stamp")
+ZONE_COLUMNS = ("Name", "Zone Name")
+PRICE_COLUMNS = ("LBMP ($/MWHr)", "DAM Zonal LBMP", "RTD Zonal LBMP")
 
 
 def parse_timestamp(value):
@@ -53,14 +57,29 @@ def expand_paths(paths):
     return expanded
 
 
+def resolve_column(fieldnames, requested, options):
+    if requested in fieldnames:
+        return requested
+
+    for option in options:
+        if option in fieldnames:
+            return option
+
+    raise ValueError(
+        f"Could not find any of these columns: {', '.join(options)}. "
+        f"Found: {', '.join(fieldnames)}"
+    )
+
+
 def load_lbmp_csv(
     paths,
-    price_column="LBMP ($/MWHr)",
-    timestamp_column="Time Stamp",
-    zone_column="Name",
+    price_column=None,
+    timestamp_column=None,
+    zone_column=None,
     zones=None,
     include_trade_sides=False,
     dates=None,
+    drop_incomplete_days=False,
 ):
     """
     Parse NYISO LBMP CSV files into daily price vectors.
@@ -69,7 +88,8 @@ def load_lbmp_csv(
         prices: [num_days, K]
         metadata: dict with dates, zones, hours, and K
     """
-    daily_prices = defaultdict(dict)
+    daily_price_totals = defaultdict(lambda: defaultdict(float))
+    daily_price_counts = defaultdict(lambda: defaultdict(int))
     seen_zones = set()
     seen_hours = set()
     dates = set(dates) if dates is not None else None
@@ -77,27 +97,44 @@ def load_lbmp_csv(
     for path in expand_paths(paths):
         with open(path, newline="") as csv_file:
             reader = csv.DictReader(csv_file)
+            fieldnames = reader.fieldnames or []
+            resolved_timestamp_column = resolve_column(
+                fieldnames,
+                timestamp_column,
+                TIMESTAMP_COLUMNS,
+            )
+            resolved_zone_column = resolve_column(fieldnames, zone_column, ZONE_COLUMNS)
+            resolved_price_column = resolve_column(fieldnames, price_column, PRICE_COLUMNS)
 
             for row in reader:
-                timestamp = parse_timestamp(row[timestamp_column])
+                timestamp = parse_timestamp(row[resolved_timestamp_column])
                 date = timestamp.date()
                 if dates is not None and date not in dates:
                     continue
 
                 hour = timestamp.hour
-                zone = row[zone_column].strip()
-                price = float(row[price_column])
+                zone = row[resolved_zone_column].strip()
+                price = float(row[resolved_price_column])
 
-                daily_prices[date][(zone, hour)] = price
+                key = (zone, hour)
+                daily_price_totals[date][key] += price
+                daily_price_counts[date][key] += 1
                 seen_zones.add(zone)
                 seen_hours.add(hour)
 
-    if not daily_prices:
+    if not daily_price_totals:
         raise ValueError("No price rows were loaded from the CSV file(s).")
+
+    daily_prices = defaultdict(dict)
+    for date, totals in daily_price_totals.items():
+        for key, total in totals.items():
+            daily_prices[date][key] = total / daily_price_counts[date][key]
 
     zones = list(zones) if zones is not None else sorted(seen_zones)
     hours = list(range(24))
     dates = sorted(daily_prices)
+    skipped_dates = []
+    loaded_dates = []
 
     price_rows = []
     for date in dates:
@@ -113,6 +150,10 @@ def load_lbmp_csv(
                 values.append(daily_prices[date][key])
         
         if missing:
+            if drop_incomplete_days:
+                skipped_dates.append(date)
+                continue
+
             missing_preview = ", ".join(missing[:5])
             raise ValueError(
                 f"{date} is missing {len(missing)} zone-hour prices "
@@ -120,20 +161,24 @@ def load_lbmp_csv(
             )
 
         price_rows.append(values)
+        loaded_dates.append(date)
 
     prices = np.asarray(price_rows, dtype=np.float32)
+    if prices.size == 0:
+        raise ValueError("No complete daily price rows were loaded from the CSV file(s).")
 
     if include_trade_sides:
         prices = np.concatenate([prices, prices], axis=1)
 
     metadata = {
-        "dates": dates,
+        "dates": loaded_dates,
         "zones": zones,
         "hours": hours,
-        "num_days": len(dates),
+        "num_days": len(loaded_dates),
         "num_zones": len(zones),
         "hours_per_day": len(hours),
         "include_trade_sides": include_trade_sides,
+        "skipped_dates": skipped_dates,
         "K": prices.shape[1],
     }
     return prices, metadata
@@ -195,6 +240,7 @@ def make_train_val_loaders(
     gap=2,
     batch_size=128,
     train_frac=0.8,
+    train_drop_last=False,
 ):
     num_days = da_prices.shape[0]
     first_valid_t = history_len + gap - 1 ## why are we starting from hist len + gap
@@ -221,7 +267,7 @@ def make_train_val_loaders(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=train_drop_last,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -238,6 +284,7 @@ def load_train_val_from_csv(
     gap=2,
     batch_size=128,
     train_frac=0.8,
+    train_drop_last=False,
     include_trade_sides=False,
     zones=None,
 ):
@@ -263,6 +310,7 @@ def load_train_val_from_csv(
         gap=gap,
         batch_size=batch_size,
         train_frac=train_frac,
+        train_drop_last=train_drop_last,
     )
     return train_loader, val_loader, da_metadata
 
@@ -271,21 +319,24 @@ def load_prices_from_zone_data(
     zone_data_dir=ZONE_DATA_DIR,
     include_trade_sides=False,
     zones=NYISO_ZONES,
+    drop_incomplete_days=True,
 ):
     zone_data_dir = Path(zone_data_dir)
-    da_paths = str(zone_data_dir / "DA" / "*.csv")
-    rt_paths = str(zone_data_dir / "RT" / "*.csv")
+    da_paths = str(zone_data_dir / "DA" / "**" / "*.csv")
+    rt_paths = str(zone_data_dir / "RT" / "**" / "*.csv")
 
     da_prices, da_metadata = load_lbmp_csv(
         da_paths,
         include_trade_sides=include_trade_sides,
         zones=zones,
+        drop_incomplete_days=drop_incomplete_days,
     )
     rt_prices, rt_metadata = load_lbmp_csv(
         rt_paths,
         include_trade_sides=include_trade_sides,
         zones=da_metadata["zones"],
         dates=da_metadata["dates"],
+        drop_incomplete_days=drop_incomplete_days,
     )
 
     if da_metadata["dates"] != rt_metadata["dates"]:
@@ -300,6 +351,7 @@ def load_train_val_from_zone_data(
     gap=2,
     batch_size=128,
     train_frac=0.8,
+    train_drop_last=False,
     include_trade_sides=False,
     zones=NYISO_ZONES,
 ):
@@ -315,6 +367,7 @@ def load_train_val_from_zone_data(
         gap=gap,
         batch_size=batch_size,
         train_frac=train_frac,
+        train_drop_last=train_drop_last,
     )
     return train_loader, val_loader, metadata
 
