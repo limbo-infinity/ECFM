@@ -12,6 +12,14 @@ def get_model_device(model):
     return next(model.parameters()).device
 
 
+def get_training_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 ## Included the penalalization of the bidding prices if they
 # go outside of the bounds of the ISO
 

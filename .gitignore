@@ -9,3 +9,8 @@ __pycache__/
 *.ckpt
 *.npy
 *.npz
+
+zone_data/DA/
+zone_data/RT/
+zone_data/_zip_cache/
+*.png 

@@ -14,18 +14,20 @@ import numpy as np
 
 ## PREDICTION MODEL g_\phi(xi)
 class PricePredictor(nn.Module):
-    def __init__(self, obs_dim, hidden_dim, T, K):
+    def __init__(self, obs_dim, hidden_dim, T, K, num_hidden_layers=2):
         super().__init__()
         self.T = T
         self.K = K
+        self.num_hidden_layers = num_hidden_layers
 
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2 * T * K),
-        )
+        layers = []
+        input_dim = obs_dim
+        for _ in range(num_hidden_layers):
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.GELU())
+            input_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, 2 * T * K))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, xi):
         out = self.net(xi)  # [batch, 2*T*K]
@@ -63,6 +65,8 @@ def train_prediction_model(
     optimizer,
     device=None,
     num_epochs=20,
+    val_loader=None,
+    verbose=True,
 ):
     """
     Train the prediction model on batches of (xi, da_true, rt_true).
@@ -70,7 +74,7 @@ def train_prediction_model(
     if device is None:
         device = next(g_phi.parameters()).device
 
-    train_loss_dict = {}
+    losses = {"train": [], "val": []}
 
     for epoch in range(num_epochs):
         g_phi.train()
@@ -97,10 +101,39 @@ def train_prediction_model(
             raise ValueError("train_loader did not provide any training batches.")
 
         avg_loss = epoch_loss / num_samples
-        train_loss_dict[epoch] = avg_loss
+        losses["train"].append(avg_loss)
 
-        print(f"Epoch {epoch + 1}/{num_epochs} | prediction loss: {avg_loss:.4f}")
+        message = f"Epoch {epoch + 1}/{num_epochs} | prediction loss: {avg_loss:.4f}"
+        if val_loader is not None:
+            val_loss = evaluate_prediction_model(g_phi, val_loader, device=device)
+            losses["val"].append(val_loss)
+            message += f" | val loss: {val_loss:.4f}"
+        if verbose:
+            print(message)
 
-    return train_loss_dict
+    return losses
 
 
+def evaluate_prediction_model(g_phi, val_loader, device=None):
+    if device is None:
+        device = next(g_phi.parameters()).device
+
+    g_phi.eval()
+    total_loss = 0.0
+    num_samples = 0
+
+    with torch.no_grad():
+        for xi, da_true, rt_true in val_loader:
+            xi = xi.to(device)
+            da_true = da_true.to(device)
+            rt_true = rt_true.to(device)
+
+            loss = pred_loss(g_phi, xi, da_true, rt_true)
+            batch_size_curr = xi.size(0)
+            total_loss += loss.item() * batch_size_curr
+            num_samples += batch_size_curr
+
+    if num_samples == 0:
+        raise ValueError("val_loader did not provide any validation batches.")
+
+    return total_loss / num_samples

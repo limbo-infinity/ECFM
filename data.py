@@ -243,7 +243,7 @@ def make_train_val_loaders(
     train_drop_last=False,
 ):
     num_days = da_prices.shape[0]
-    first_valid_t = history_len + gap - 1 ## why are we starting from hist len + gap
+    first_valid_t = history_len + gap - 1
     all_target_days = np.arange(first_valid_t, num_days)
     train_days = int(train_frac * num_days)
     train_target_days = all_target_days[all_target_days < train_days]
@@ -325,17 +325,17 @@ def load_prices_from_zone_data(
     da_paths = str(zone_data_dir / "DA" / "**" / "*.csv")
     rt_paths = str(zone_data_dir / "RT" / "**" / "*.csv")
 
-    da_prices, da_metadata = load_lbmp_csv(
-        da_paths,
+    rt_prices, rt_metadata = load_lbmp_csv(
+        rt_paths,
         include_trade_sides=include_trade_sides,
         zones=zones,
         drop_incomplete_days=drop_incomplete_days,
     )
-    rt_prices, rt_metadata = load_lbmp_csv(
-        rt_paths,
+    da_prices, da_metadata = load_lbmp_csv(
+        da_paths,
         include_trade_sides=include_trade_sides,
-        zones=da_metadata["zones"],
-        dates=da_metadata["dates"],
+        zones=rt_metadata["zones"],
+        dates=rt_metadata["dates"],
         drop_incomplete_days=drop_incomplete_days,
     )
 
@@ -375,7 +375,8 @@ def load_train_val_from_zone_data(
 def main():
     history_len = 30
     gap = 2
-    batch_size = 128
+    batch_size = 32 ##Change these hyperparameters later in main not here this is
+                    ## just for checking that it works 
     train_frac = 0.8
     include_trade_sides = False
 
