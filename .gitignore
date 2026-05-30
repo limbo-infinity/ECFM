@@ -13,4 +13,5 @@ __pycache__/
 zone_data/DA/
 zone_data/RT/
 zone_data/_zip_cache/
-*.png 
+experiments/
+*.png

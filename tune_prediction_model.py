@@ -34,7 +34,7 @@ def sample_random_params():
     return {
         "history_len": random.randint(*SEARCH_SPACE["history_len"]),
         "hidden_dim": random.choice(SEARCH_SPACE["hidden_dim"]),
-        "num_hidden_layers": random.choice(SEARCH_SPACE["num_hidden_layers"]),
+        "num_hidden_layers": random.randint(*SEARCH_SPACE["num_hidden_layers"]),
         "batch_size": random.choice(SEARCH_SPACE["batch_size"]),
         "learning_rate": 10 ** random.uniform(
             math.log10(SEARCH_SPACE["learning_rate"][0]),
@@ -52,7 +52,7 @@ def encode_params(params):
         [
             params["history_len"],
             SEARCH_SPACE["hidden_dim"].index(params["hidden_dim"]),
-            SEARCH_SPACE["num_hidden_layers"].index(params["num_hidden_layers"]),
+            params["num_hidden_layers"],
             SEARCH_SPACE["batch_size"].index(params["batch_size"]),
             math.log10(params["learning_rate"]),
             math.log10(params["weight_decay"]),
@@ -64,7 +64,7 @@ def encode_params(params):
 def decode_params(encoded):
     history_low, history_high = SEARCH_SPACE["history_len"]
     hidden_values = SEARCH_SPACE["hidden_dim"]
-    layer_values = SEARCH_SPACE["num_hidden_layers"]
+    layer_low, layer_high = SEARCH_SPACE["num_hidden_layers"]
     batch_values = SEARCH_SPACE["batch_size"]
     lr_low, lr_high = SEARCH_SPACE["learning_rate"]
     wd_low, wd_high = SEARCH_SPACE["weight_decay"]
@@ -74,9 +74,7 @@ def decode_params(encoded):
         "hidden_dim": hidden_values[
             int(round(np.clip(encoded[1], 0, len(hidden_values) - 1)))
         ],
-        "num_hidden_layers": layer_values[
-            int(round(np.clip(encoded[2], 0, len(layer_values) - 1)))
-        ],
+        "num_hidden_layers": int(round(np.clip(encoded[2], layer_low, layer_high))),
         "batch_size": batch_values[
             int(round(np.clip(encoded[3], 0, len(batch_values) - 1)))
         ],
@@ -120,7 +118,17 @@ def propose_params(results, num_candidates=512):
     return decode_params(best_candidate)
 
 
-def run_trial(trial_id, params, da_prices, rt_prices, device, num_epochs, gap, seed):
+def run_trial(
+    trial_id,
+    params,
+    da_prices,
+    rt_prices,
+    device,
+    num_epochs,
+    gap,
+    seed,
+    prediction_target,
+):
     set_seed(seed + trial_id)
     train_loader, val_loader = make_train_val_loaders(
         da_prices=da_prices,
@@ -139,6 +147,7 @@ def run_trial(trial_id, params, da_prices, rt_prices, device, num_epochs, gap, s
         T=1,
         K=k,
         num_hidden_layers=params["num_hidden_layers"],
+        output_mode=prediction_target,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -154,15 +163,27 @@ def run_trial(trial_id, params, da_prices, rt_prices, device, num_epochs, gap, s
         device=device,
         num_epochs=num_epochs,
         verbose=False,
+        loss_mode=prediction_target,
     )
-    final_train_loss = evaluate_prediction_model(model, train_loader, device=device)
-    final_val_loss = evaluate_prediction_model(model, val_loader, device=device)
+    final_train_loss = evaluate_prediction_model(
+        model,
+        train_loader,
+        device=device,
+        loss_mode=prediction_target,
+    )
+    final_val_loss = evaluate_prediction_model(
+        model,
+        val_loader,
+        device=device,
+        loss_mode=prediction_target,
+    )
     return {
         "trial": trial_id,
         "params": params,
         "train_epoch_loss": losses["train"][-1],
         "train_loss": final_train_loss,
         "val_loss": final_val_loss,
+        "prediction_target": prediction_target,
     }
 
 
@@ -172,6 +193,7 @@ def save_results(results, output_path):
         "val_loss",
         "train_loss",
         "train_epoch_loss",
+        "prediction_target",
         "history_len",
         "hidden_dim",
         "num_hidden_layers",
@@ -188,6 +210,7 @@ def save_results(results, output_path):
                 "val_loss": result["val_loss"],
                 "train_loss": result["train_loss"],
                 "train_epoch_loss": result["train_epoch_loss"],
+                "prediction_target": result["prediction_target"],
                 **result["params"],
             }
             writer.writerow(row)
@@ -198,6 +221,7 @@ def main():
     num_initial_random = 5
     num_epochs = 30
     gap = 1
+    prediction_target = "spread"
     seed = 42
     output_path = Path("bayesian_tuning_results.csv")
 
@@ -223,6 +247,7 @@ def main():
             num_epochs=num_epochs,
             gap=gap,
             seed=seed,
+            prediction_target=prediction_target,
         )
         results.append(result)
         save_results(results, output_path)
