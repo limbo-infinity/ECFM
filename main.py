@@ -102,7 +102,8 @@ if __name__ == "__main__":
     model_type = "spread_mlp"
     q_max = 1.0
     budget = 50.0
-    decision_temperature = 25.0
+    bid_low = -1000.0
+    bid_up = 2000.0
 
     train_loader, val_loader, metadata = load_train_val_from_zone_data(
         history_len=history_len,
@@ -135,9 +136,15 @@ if __name__ == "__main__":
     benchmark_config = {
         "q_max": q_max,
         "budget": budget,
-        "decision_temperature": decision_temperature,
-        "policy": "q = q_max * tanh(predicted_spread / decision_temperature), projected to L1 budget",
-        "profit": "sum(q * (DA - RT))",
+        "bid_low": bid_low,
+        "bid_up": bid_up,
+        "policy": (
+            "Binary virtual bid policy. Demand if predicted DA-RT < 0, "
+            "supply if predicted DA-RT > 0. Keep top-|spread| bids within "
+            "the L1 budget."
+        ),
+        "clearing": "sigmoid(q * (bid_price - DA))",
+        "profit": "sum(q * (RT - DA) * cleared_probability)",
     }
     config = {
         "model_type": model_type,
@@ -207,7 +214,8 @@ if __name__ == "__main__":
         device=device,
         q_max=q_max,
         budget=budget,
-        temperature=decision_temperature,
+        bid_low=bid_low,
+        bid_up=bid_up,
     )
     val_benchmark_metrics, val_benchmark_arrays = evaluate_spread_policy(
         g_phi,
@@ -215,7 +223,8 @@ if __name__ == "__main__":
         device=device,
         q_max=q_max,
         budget=budget,
-        temperature=decision_temperature,
+        bid_low=bid_low,
+        bid_up=bid_up,
     )
 
     plot_path = logger.path("prediction_loss.png")
