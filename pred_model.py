@@ -55,6 +55,35 @@ class PricePredictor(nn.Module):
         rt_pred = out[:, :, 1, :]
 
         return da_pred, rt_pred
+
+
+class DirectBidMLP(nn.Module):
+    def __init__(self, T, K, hidden_dim, num_hidden_layers=2):
+        super().__init__()
+        self.T = T
+        self.K = K
+        self.num_hidden_layers = num_hidden_layers
+
+        layers = []
+        input_dim = 2 * T * K
+        for _ in range(num_hidden_layers):
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.GELU())
+            input_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, T * K))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, da_cond, rt_cond):
+        batch_size = da_cond.shape[0]
+        cond = torch.cat(
+            [
+                da_cond.reshape(batch_size, -1),
+                rt_cond.reshape(batch_size, -1),
+            ],
+            dim=-1,
+        )
+        raw_bid = self.net(cond)
+        return raw_bid.view(batch_size, self.T, self.K)
     
     
 def price_mse_loss(g_phi, xi, da_true, rt_true):

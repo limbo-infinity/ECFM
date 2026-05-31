@@ -9,15 +9,6 @@ import torch.nn.functional as F
 
 
 
-def train_end_to_end(
-    *args,
-    **kwargs,
-):
-    raise NotImplementedError(
-        "Use train_end_to_end_q_bid for the option-C virtual bidding pipeline."
-    )
-
-
 def _flow_condition_from_prediction(prediction_output):
     if isinstance(prediction_output, tuple):
         return prediction_output
@@ -265,6 +256,96 @@ def train_end_to_end_fixed_q_bid(
         print(
             f"Epoch {epoch + 1}/{num_epochs} | "
             f"total loss: {avg_loss:.4f} | "
+            f"energy: {avg_energy_loss:.4f} | "
+            f"spread reg: {avg_spread_regularizer:.4f}"
+        )
+
+    return losses
+
+
+def train_end_to_end_direct_bid(
+    prediction_model,
+    bid_model,
+    train_loader,
+    optimizer,
+    low,
+    up,
+    budget,
+    q_max=1.0,
+    device=None,
+    num_epochs=20,
+    alpha=1.0,
+    penalty_weight=100.0,
+    prediction_regularizer_weight=0.0,
+):
+    """
+    Direct MLP baseline: predicted prices -> one raw bid-price vector.
+    """
+    if device is None:
+        device = get_model_device(prediction_model)
+
+    losses = {
+        "total": [],
+        "energy": [],
+        "spread_regularizer": [],
+    }
+    prediction_model.train()
+    bid_model.train()
+
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        total_energy_loss = 0.0
+        total_spread_regularizer = 0.0
+        num_batches = 0
+
+        for xi, da_true, rt_true in train_loader:
+            xi = xi.to(device)
+            da_true = da_true.to(device)
+            rt_true = rt_true.to(device)
+
+            optimizer.zero_grad()
+
+            prediction_output = prediction_model(xi)
+            da_cond, rt_cond = _flow_condition_from_prediction(prediction_output)
+            spread_pred = _spread_from_prediction(prediction_output)
+            q = fixed_q_from_spread(spread_pred, q_max=q_max)
+            raw_bid = bid_model(da_cond, rt_cond)
+
+            energy, _ = fixed_q_bid_trading_energy(
+                x=raw_bid,
+                da_price=da_true,
+                rt_price=rt_true,
+                low=low,
+                up=up,
+                budget=budget,
+                q=q,
+                alpha=alpha,
+                penalty_weight=penalty_weight,
+            )
+            energy_loss = energy.mean()
+            spread_regularizer = _spread_mse_from_prediction(
+                prediction_output,
+                da_true,
+                rt_true,
+            )
+            loss = energy_loss + prediction_regularizer_weight * spread_regularizer
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_energy_loss += energy_loss.item()
+            total_spread_regularizer += spread_regularizer.item()
+            num_batches += 1
+
+        avg_loss = total_loss / max(num_batches, 1)
+        avg_energy_loss = total_energy_loss / max(num_batches, 1)
+        avg_spread_regularizer = total_spread_regularizer / max(num_batches, 1)
+        losses["total"].append(avg_loss)
+        losses["energy"].append(avg_energy_loss)
+        losses["spread_regularizer"].append(avg_spread_regularizer)
+        print(
+            f"Epoch {epoch + 1}/{num_epochs} | "
+            f"direct total loss: {avg_loss:.4f} | "
             f"energy: {avg_energy_loss:.4f} | "
             f"spread reg: {avg_spread_regularizer:.4f}"
         )
