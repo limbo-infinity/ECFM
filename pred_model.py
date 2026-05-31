@@ -12,7 +12,7 @@ import numpy as np
 # rt_true   # [batch, T, K]   real-time prices pi
 # x         # [batch, T, K]   generated bids
 
-## PREDICTION MODEL g_\phi(xi)
+## PREDICTION MODEL g_phi(xi)
 class PricePredictor(nn.Module):
     def __init__(
         self,
