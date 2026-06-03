@@ -25,6 +25,7 @@ from pred_model import (
 from train import train_end_to_end_direct_bid, train_end_to_end_fixed_q_bid
 from virtual_trading_simulator import (
     evaluate_direct_bid_policy,
+    evaluate_dpds_policy,
     evaluate_fixed_q_bid_policy,
 )
 
@@ -187,6 +188,79 @@ def plot_langevin_losses(train_trace, val_trace, output_path, hyperparams):
     plt.close()
 
 
+def plot_validation_policy_profits(
+    policy_profit_series,
+    target_dates,
+    output_path,
+    hyperparams,
+):
+    if not policy_profit_series:
+        return
+
+    min_len = min(len(values) for values in policy_profit_series.values())
+    if min_len == 0:
+        return
+
+    x = np.arange(min_len)
+    dates = list(target_dates)[:min_len]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    for label, values in policy_profit_series.items():
+        profits = np.asarray(values, dtype=np.float32).reshape(-1)[:min_len]
+        axes[0].plot(x, profits, marker="o", markersize=3, linewidth=1.3, label=label)
+        axes[1].plot(
+            x,
+            np.cumsum(profits),
+            marker="o",
+            markersize=3,
+            linewidth=1.3,
+            label=label,
+        )
+
+    axes[0].axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+    axes[1].axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+    axes[0].set_ylabel("Daily profit")
+    axes[1].set_ylabel("Cumulative profit")
+    axes[1].set_xlabel("Validation day")
+    axes[0].set_title("Validation policy profit per day")
+
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left")
+
+    if dates:
+        tick_count = min(8, len(dates))
+        tick_positions = np.linspace(0, len(dates) - 1, tick_count, dtype=int)
+        axes[1].set_xticks(tick_positions)
+        axes[1].set_xticklabels([dates[i] for i in tick_positions], rotation=30, ha="right")
+
+    annotation = "\n".join(
+        [
+            f"history_len: {hyperparams['history_len']}",
+            f"gap: {hyperparams['gap']}",
+            f"q_max: {hyperparams['q_max']}",
+            f"budget: {hyperparams['budget']}",
+            f"risk_loss: {hyperparams['risk_loss_mode']}",
+            f"sharpe_weight: {hyperparams['sharpe_loss_weight']:.2e}",
+            f"variance_weight: {hyperparams['variance_loss_weight']:.2e}",
+        ]
+    )
+    axes[0].text(
+        0.985,
+        0.95,
+        annotation,
+        transform=axes[0].transAxes,
+        fontsize=9,
+        va="top",
+        ha="right",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+    )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
 def plot_prediction_losses(losses, output_path, hyperparams):
     epochs = range(1, len(losses["train"]) + 1)
 
@@ -248,10 +322,15 @@ if __name__ == "__main__":
     prediction_weight_decay = 1e-3
     end_to_end_weight_decay = 1e-4
     prediction_regularizer_weight = 0.03
+    risk_loss_mode = "sharpe"
+    sharpe_loss_weight = 0.1
+    variance_loss_weight = 0.1
     train_num_samples = 4
     train_num_flow_steps = 15
     eval_num_samples = 8
     eval_num_flow_steps = 20
+    dpds_grid_size = 25
+    dpds_rho = 0.002 # value used in the paper
     langevin_steps = 20
     langevin_step_size = 1e-4
     alpha = 5.0
@@ -261,7 +340,7 @@ if __name__ == "__main__":
     bid_low = -1000.0
     bid_up = 2000.0
     feature_set = "historical_da_rt_prices"
-    model_type = "ecfm_fixed_q_bid"
+    model_type = "ecfm_withsharpe"
 
     train_loader, val_loader, metadata = load_train_val_from_zone_data(
         history_len=history_len,
@@ -296,10 +375,15 @@ if __name__ == "__main__":
         "prediction_weight_decay": prediction_weight_decay,
         "end_to_end_weight_decay": end_to_end_weight_decay,
         "prediction_regularizer_weight": prediction_regularizer_weight,
+        "risk_loss_mode": risk_loss_mode,
+        "sharpe_loss_weight": sharpe_loss_weight,
+        "variance_loss_weight": variance_loss_weight,
         "train_num_samples": train_num_samples,
         "train_num_flow_steps": train_num_flow_steps,
         "eval_num_samples": eval_num_samples,
         "eval_num_flow_steps": eval_num_flow_steps,
+        "dpds_grid_size": dpds_grid_size,
+        "dpds_rho": dpds_rho,
         "langevin_steps": langevin_steps,
         "langevin_step_size": langevin_step_size,
         "alpha": alpha,
@@ -344,6 +428,14 @@ if __name__ == "__main__":
                 "sample candidates from the flow, pick the lowest predicted-energy "
                 "candidate, then optionally run Langevin refinement using predicted prices"
             ),
+        },
+        "dpds_baseline": {
+            "policy": (
+                "risk-neutral DPDS over the paper's discrete bid set, using "
+                "historical DA/RT observations available through target_day - gap"
+            ),
+            "grid": "D = {0, B/alpha, 2B/alpha, ..., B}",
+            "budget_constraint": "sum translated demand/supply bid values <= budget",
         },
     }
     logger.save_config(config)
@@ -417,6 +509,9 @@ if __name__ == "__main__":
         alpha=alpha,
         penalty_weight=penalty_weight,
         prediction_regularizer_weight=prediction_regularizer_weight,
+        risk_loss_mode=risk_loss_mode,
+        sharpe_loss_weight=sharpe_loss_weight,
+        variance_loss_weight=variance_loss_weight,
     )
 
     end_to_end_optimizer = torch.optim.AdamW(
@@ -440,6 +535,9 @@ if __name__ == "__main__":
         alpha=alpha,
         penalty_weight=penalty_weight,
         prediction_regularizer_weight=prediction_regularizer_weight,
+        risk_loss_mode=risk_loss_mode,
+        sharpe_loss_weight=sharpe_loss_weight,
+        variance_loss_weight=variance_loss_weight,
     )
 
     final_train_prediction_loss = evaluate_prediction_model(
@@ -526,11 +624,27 @@ if __name__ == "__main__":
         langevin_steps=langevin_steps,
         langevin_step_size=langevin_step_size,
     )
+    da_price_matrix = train_loader.dataset.da_prices.detach().cpu().numpy()
+    rt_price_matrix = train_loader.dataset.rt_prices.detach().cpu().numpy()
+    dpds_val_policy_metrics, dpds_val_policy_arrays = evaluate_dpds_policy(
+        da_prices=da_price_matrix,
+        rt_prices=rt_price_matrix,
+        target_indices=val_loader.dataset.target_indices,
+        gap=gap,
+        budget=budget,
+        bid_low=bid_low,
+        bid_up=bid_up,
+        q_max=q_max,
+        alpha=alpha,
+        grid_size=dpds_grid_size,
+        rho=dpds_rho,
+    )
 
     prediction_plot_path = logger.path("prediction_pretrain_loss.png")
     direct_plot_path = logger.path("direct_mlp_loss.png")
     end_to_end_plot_path = logger.path("end_to_end_loss.png")
     langevin_plot_path = logger.path("langevin_refinement_loss.png")
+    validation_profit_plot_path = logger.path("validation_policy_profit.png")
     plot_prediction_losses(prediction_losses, prediction_plot_path, hyperparams)
     plot_end_to_end_losses(
         direct_losses,
@@ -548,6 +662,20 @@ if __name__ == "__main__":
         langevin_plot_path,
         hyperparams,
     )
+    validation_target_dates = [
+        metadata["dates"][int(target_index)]
+        for target_index in val_loader.dataset.target_indices
+    ]
+    plot_validation_policy_profits(
+        {
+            "Direct MLP": direct_val_policy_arrays["profit"],
+            "DPDS": dpds_val_policy_arrays["profit"],
+            "ECFM": val_policy_arrays["profit"],
+        },
+        validation_target_dates,
+        validation_profit_plot_path,
+        hyperparams,
+    )
     logger.save_npz(
         "losses.npz",
         prediction_train_loss=np.asarray(prediction_losses["train"], dtype=np.float32),
@@ -558,10 +686,25 @@ if __name__ == "__main__":
             direct_losses["spread_regularizer"],
             dtype=np.float32,
         ),
+        direct_risk_loss=np.asarray(direct_losses["risk"], dtype=np.float32),
+        direct_batch_sharpe=np.asarray(direct_losses["batch_sharpe"], dtype=np.float32),
+        direct_profit_variance=np.asarray(
+            direct_losses["profit_variance"],
+            dtype=np.float32,
+        ),
         end_to_end_total_loss=np.asarray(end_to_end_losses["total"], dtype=np.float32),
         end_to_end_energy_loss=np.asarray(end_to_end_losses["energy"], dtype=np.float32),
         end_to_end_spread_regularizer=np.asarray(
             end_to_end_losses["spread_regularizer"],
+            dtype=np.float32,
+        ),
+        end_to_end_risk_loss=np.asarray(end_to_end_losses["risk"], dtype=np.float32),
+        end_to_end_batch_sharpe=np.asarray(
+            end_to_end_losses["batch_sharpe"],
+            dtype=np.float32,
+        ),
+        end_to_end_profit_variance=np.asarray(
+            end_to_end_losses["profit_variance"],
             dtype=np.float32,
         ),
         train_langevin_energy_trace=train_policy_arrays["langevin_energy_trace"],
@@ -569,6 +712,7 @@ if __name__ == "__main__":
     )
     logger.save_npz("direct_train_policy_arrays.npz", **direct_train_policy_arrays)
     logger.save_npz("direct_val_policy_arrays.npz", **direct_val_policy_arrays)
+    logger.save_npz("dpds_val_policy_arrays.npz", **dpds_val_policy_arrays)
     logger.save_npz("train_policy_arrays.npz", **train_policy_arrays)
     logger.save_npz("val_policy_arrays.npz", **val_policy_arrays)
 
@@ -580,6 +724,9 @@ if __name__ == "__main__":
         "direct_final_total_loss": direct_losses["total"][-1],
         "direct_final_energy_loss": direct_losses["energy"][-1],
         "direct_final_spread_regularizer": direct_losses["spread_regularizer"][-1],
+        "direct_final_risk_loss": direct_losses["risk"][-1],
+        "direct_final_batch_sharpe": direct_losses["batch_sharpe"][-1],
+        "direct_final_profit_variance": direct_losses["profit_variance"][-1],
         "final_train_prediction_loss": final_train_prediction_loss,
         "final_val_prediction_loss": final_val_prediction_loss,
         "final_end_to_end_total_loss": end_to_end_losses["total"][-1],
@@ -587,10 +734,28 @@ if __name__ == "__main__":
         "final_end_to_end_spread_regularizer": end_to_end_losses[
             "spread_regularizer"
         ][-1],
+        "final_end_to_end_risk_loss": end_to_end_losses["risk"][-1],
+        "final_end_to_end_batch_sharpe": end_to_end_losses["batch_sharpe"][-1],
+        "final_end_to_end_profit_variance": end_to_end_losses[
+            "profit_variance"
+        ][-1],
+        "direct_val_total_profit": direct_val_policy_metrics["policy_total_profit"],
+        "direct_val_annualized_sharpe": direct_val_policy_metrics[
+            "policy_annualized_sharpe"
+        ],
+        "ecfm_val_total_profit": val_policy_metrics["policy_total_profit"],
+        "ecfm_val_annualized_sharpe": val_policy_metrics[
+            "policy_annualized_sharpe"
+        ],
+        "dpds_val_total_profit": dpds_val_policy_metrics["policy_total_profit"],
+        "dpds_val_annualized_sharpe": dpds_val_policy_metrics[
+            "policy_annualized_sharpe"
+        ],
         **prefix_metrics("train_policy", train_policy_metrics),
         **prefix_metrics("val_policy", val_policy_metrics),
         **prefix_metrics("direct_train_policy", direct_train_policy_metrics),
         **prefix_metrics("direct_val_policy", direct_val_policy_metrics),
+        **prefix_metrics("dpds_val_policy", dpds_val_policy_metrics),
     }
     logger.save_metrics_csv("metrics.csv", metrics)
     logger.save_summary(
@@ -606,9 +771,11 @@ if __name__ == "__main__":
             "direct_loss_plot": "direct_mlp_loss.png",
             "end_to_end_loss_plot": "end_to_end_loss.png",
             "langevin_loss_plot": "langevin_refinement_loss.png",
+            "validation_profit_plot": "validation_policy_profit.png",
             "loss_arrays": "losses.npz",
             "direct_train_policy_arrays": "direct_train_policy_arrays.npz",
             "direct_val_policy_arrays": "direct_val_policy_arrays.npz",
+            "dpds_val_policy_arrays": "dpds_val_policy_arrays.npz",
             "train_policy_arrays": "train_policy_arrays.npz",
             "val_policy_arrays": "val_policy_arrays.npz",
             "metrics": metrics,
@@ -651,6 +818,9 @@ if __name__ == "__main__":
             "final_total_loss": direct_losses["total"][-1],
             "final_energy_loss": direct_losses["energy"][-1],
             "final_spread_regularizer": direct_losses["spread_regularizer"][-1],
+            "final_risk_loss": direct_losses["risk"][-1],
+            "final_batch_sharpe": direct_losses["batch_sharpe"][-1],
+            "final_profit_variance": direct_losses["profit_variance"][-1],
         },
     )
     logger.save_model(
@@ -680,6 +850,11 @@ if __name__ == "__main__":
             "final_end_to_end_spread_regularizer": end_to_end_losses[
                 "spread_regularizer"
             ][-1],
+            "final_end_to_end_risk_loss": end_to_end_losses["risk"][-1],
+            "final_end_to_end_batch_sharpe": end_to_end_losses["batch_sharpe"][-1],
+            "final_end_to_end_profit_variance": end_to_end_losses[
+                "profit_variance"
+            ][-1],
         },
     )
 
@@ -692,9 +867,22 @@ if __name__ == "__main__":
         "Direct MLP validation policy Sharpe: "
         f"{direct_val_policy_metrics['policy_annualized_sharpe']:.4f}"
     )
+    print(
+        "DPDS validation policy profit: "
+        f"{dpds_val_policy_metrics['policy_total_profit']:.4f}"
+    )
+    print(
+        "DPDS validation policy Sharpe: "
+        f"{dpds_val_policy_metrics['policy_annualized_sharpe']:.4f}"
+    )
     print(f"Final val prediction loss: {final_val_prediction_loss:.4f}")
     print(f"Final end-to-end total loss: {end_to_end_losses['total'][-1]:.4f}")
     print(f"Final end-to-end energy loss: {end_to_end_losses['energy'][-1]:.4f}")
+    print(f"Final end-to-end risk loss: {end_to_end_losses['risk'][-1]:.4f}")
+    print(
+        "Final end-to-end batch Sharpe: "
+        f"{end_to_end_losses['batch_sharpe'][-1]:.4f}"
+    )
     print(
         "Final end-to-end spread regularizer: "
         f"{end_to_end_losses['spread_regularizer'][-1]:.4f}"

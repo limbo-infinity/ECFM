@@ -128,7 +128,7 @@ def simulate_positions(positions, da_true, rt_true, budget):
     }
 
 
-def decision_metrics(profit, budget_violation, l1_usage, annualization=252):
+def decision_metrics(profit, budget_violation, l1_usage, annualization=365):
     profit_np = profit.detach().cpu().numpy()
     mean_profit = float(profit_np.mean())
     std_profit = float(profit_np.std(ddof=1)) if profit_np.size > 1 else 0.0
@@ -149,6 +149,206 @@ def decision_metrics(profit, budget_violation, l1_usage, annualization=252):
         "mean_l1_usage": _as_float(l1_usage.mean()),
         "max_l1_usage": _as_float(l1_usage.max()),
     }
+
+
+def _dpds_option_rewards(
+    da_hist,
+    rt_hist,
+    grid,
+    demand_reference,
+    supply_reference,
+    rho=0.0,
+):
+    num_days, K = da_hist.shape
+    rewards = np.zeros((2 * K, grid.size), dtype=np.float32)
+    demand_payoff = rt_hist - da_hist
+    supply_payoff = da_hist - rt_hist
+
+    for k in range(K):
+        demand_threshold = da_hist[:, k] - demand_reference
+        demand_cleared = grid[None, :] >= demand_threshold[:, None]
+        demand_values = demand_payoff[:, k, None] * demand_cleared
+        rewards[k] = demand_values.mean(axis=0)
+
+        supply_threshold = supply_reference - da_hist[:, k]
+        supply_cleared = grid[None, :] >= supply_threshold[:, None]
+        supply_values = supply_payoff[:, k, None] * supply_cleared
+        rewards[K + k] = supply_values.mean(axis=0)
+
+        if rho > 0.0 and num_days > 1:
+            rewards[k] -= rho * demand_values.var(axis=0, ddof=1)
+            rewards[K + k] -= rho * supply_values.var(axis=0, ddof=1)
+
+    rewards[:, 0] = 0.0
+    return rewards
+
+
+def _solve_dpds_grid(rewards):
+    num_options, num_grid = rewards.shape
+    max_budget_index = num_grid - 1
+    costs = np.arange(num_grid)
+    minus_inf = np.float32(-1.0e30)
+    dp = np.full(max_budget_index + 1, minus_inf, dtype=np.float32)
+    dp[0] = 0.0
+    choices = np.zeros((num_options, max_budget_index + 1), dtype=np.int16)
+
+    for option_idx in range(num_options):
+        next_dp = np.full_like(dp, minus_inf)
+        for budget_idx in range(max_budget_index + 1):
+            feasible_costs = costs[: budget_idx + 1]
+            values = dp[budget_idx - feasible_costs] + rewards[
+                option_idx,
+                feasible_costs,
+            ]
+            best_local = int(values.argmax())
+            choices[option_idx, budget_idx] = feasible_costs[best_local]
+            next_dp[budget_idx] = values[best_local]
+        dp = next_dp
+
+    selected = np.zeros(num_options, dtype=np.int16)
+    budget_idx = max_budget_index
+    for option_idx in range(num_options - 1, -1, -1):
+        selected_cost = choices[option_idx, budget_idx]
+        selected[option_idx] = selected_cost
+        budget_idx -= int(selected_cost)
+
+    return selected, float(dp[max_budget_index])
+
+
+def evaluate_dpds_policy(
+    da_prices,
+    rt_prices,
+    target_indices,
+    gap,
+    budget,
+    bid_low,
+    bid_up,
+    q_max=1.0,
+    alpha=5.0,
+    grid_size=50,
+    rho=0.0,
+):
+    da_prices = np.asarray(da_prices, dtype=np.float32)
+    rt_prices = np.asarray(rt_prices, dtype=np.float32)
+    target_indices = list(target_indices)
+    use_paper_grid = isinstance(grid_size, str) and grid_size.lower() == "paper"
+
+    demand_bids = []
+    supply_bids = []
+    demand_actual_prices = []
+    supply_actual_prices = []
+    profits = []
+    l1_usages = []
+    violations = []
+    selected_values = []
+    history_lengths = []
+    grid_sizes = []
+
+    start_time = time.perf_counter()
+    for target_day in target_indices:
+        latest_observed_day = target_day - gap
+        if latest_observed_day < 0:
+            continue
+
+        da_hist = da_prices[: latest_observed_day + 1]
+        rt_hist = rt_prices[: latest_observed_day + 1]
+        if use_paper_grid:
+            day_grid_size = max(da_hist.shape[0] - 1, 2)
+        else:
+            day_grid_size = int(grid_size)
+        grid = np.linspace(
+            0.0,
+            float(budget),
+            day_grid_size + 1,
+            dtype=np.float32,
+        )
+        demand_reference = float(da_hist.min())
+        supply_reference = float(da_hist.max())
+        rewards = _dpds_option_rewards(
+            da_hist,
+            rt_hist,
+            grid,
+            demand_reference=demand_reference,
+            supply_reference=supply_reference,
+            rho=rho,
+        )
+        selected_costs, selected_value = _solve_dpds_grid(rewards)
+
+        K = da_prices.shape[1]
+        demand_x = grid[selected_costs[:K]]
+        supply_x = grid[selected_costs[K:]]
+        demand_bid = np.clip(demand_reference + demand_x, bid_low, bid_up)
+        supply_bid = np.clip(supply_reference - supply_x, bid_low, bid_up)
+
+        da_true = da_prices[target_day]
+        rt_true = rt_prices[target_day]
+        demand_q = np.where(demand_x > 0.0, q_max, 0.0).astype(np.float32)
+        supply_q = np.where(supply_x > 0.0, -q_max, 0.0).astype(np.float32)
+        demand_logit = np.clip(alpha * demand_q * (demand_bid - da_true), -60.0, 60.0)
+        supply_logit = np.clip(alpha * supply_q * (supply_bid - da_true), -60.0, 60.0)
+        demand_clear = 1.0 / (1.0 + np.exp(-demand_logit))
+        supply_clear = 1.0 / (1.0 + np.exp(-supply_logit))
+        demand_profit = demand_q * (rt_true - da_true) * demand_clear
+        supply_profit = supply_q * (rt_true - da_true) * supply_clear
+        profit = float(demand_profit.sum() + supply_profit.sum())
+        l1_usage = float(demand_x.sum() + supply_x.sum())
+        violation = max(l1_usage - float(budget), 0.0)
+
+        demand_bids.append(demand_x)
+        supply_bids.append(supply_x)
+        demand_actual_prices.append(demand_bid)
+        supply_actual_prices.append(supply_bid)
+        profits.append(profit)
+        l1_usages.append(l1_usage)
+        violations.append(violation)
+        selected_values.append(selected_value)
+        history_lengths.append(latest_observed_day + 1)
+        grid_sizes.append(day_grid_size)
+
+    elapsed_seconds = time.perf_counter() - start_time
+    profit_tensor = torch.as_tensor(profits, dtype=torch.float32)
+    violation_tensor = torch.as_tensor(violations, dtype=torch.float32).unsqueeze(-1)
+    l1_tensor = torch.as_tensor(l1_usages, dtype=torch.float32).unsqueeze(-1)
+
+    metrics = {
+        "latency_seconds": float(elapsed_seconds),
+        "latency_ms_per_day": float(elapsed_seconds * 1000.0 / max(len(profits), 1)),
+        "mean_selected_empirical_value": float(np.mean(selected_values))
+        if selected_values
+        else 0.0,
+        "mean_history_days": float(np.mean(history_lengths)) if history_lengths else 0.0,
+        "grid_mode": "paper" if use_paper_grid else "fixed",
+        "grid_size": 0 if use_paper_grid else int(grid_size),
+        "mean_grid_size": float(np.mean(grid_sizes)) if grid_sizes else 0.0,
+        "min_grid_size": int(np.min(grid_sizes)) if grid_sizes else 0,
+        "max_grid_size": int(np.max(grid_sizes)) if grid_sizes else 0,
+        "rho": float(rho),
+    }
+    metrics.update(
+        {
+            f"policy_{key}": value
+            for key, value in decision_metrics(
+                profit_tensor,
+                violation_tensor,
+                l1_tensor,
+            ).items()
+        }
+    )
+
+    arrays = {
+        "target_indices": np.asarray(target_indices, dtype=np.int64),
+        "demand_bid_translated": np.asarray(demand_bids, dtype=np.float32),
+        "supply_bid_translated": np.asarray(supply_bids, dtype=np.float32),
+        "demand_bid_price": np.asarray(demand_actual_prices, dtype=np.float32),
+        "supply_bid_price": np.asarray(supply_actual_prices, dtype=np.float32),
+        "profit": np.asarray(profits, dtype=np.float32),
+        "l1_usage": np.asarray(l1_usages, dtype=np.float32),
+        "budget_violation": np.asarray(violations, dtype=np.float32),
+        "selected_empirical_value": np.asarray(selected_values, dtype=np.float32),
+        "history_lengths": np.asarray(history_lengths, dtype=np.int64),
+        "grid_sizes": np.asarray(grid_sizes, dtype=np.int64),
+    }
+    return metrics, arrays
 
 
 def evaluate_spread_policy(
@@ -656,18 +856,18 @@ def evaluate_fixed_q_bid_policy(
             cleared_prob = torch.sigmoid(alpha * q * (bid_price - da_true))
             profit = (q * (rt_true - da_true) * cleared_prob).sum(dim=(1, 2))
             l1_usage = bid_price.abs().sum(dim=-1)
-            budget_violation = F.relu(l1_usage - budget)
+            budget_violation = F.relu(l1_usage - budget) ##should be 0 if we use the bid projection
 
             _, oracle_actual_decision, oracle_bid_price, _ = binary_bids_from_spread(
                 da_true - rt_true,
-                q_max=q_max,
+                q_max=q_max,  # this is the perfect decisions
                 budget=budget,
                 bid_low=low,
                 bid_up=up,
             )
             oracle_sim = simulate_binary_virtual_bids(
                 oracle_actual_decision,
-                oracle_bid_price,
+                oracle_bid_price, 
                 da_true,
                 rt_true,
                 budget=budget,

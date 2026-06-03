@@ -177,6 +177,7 @@ def fixed_q_bid_trading_energy(
     budget,
     q,
     alpha=1.0,
+    lam=0.1,
     penalty_weight=100.0,
     return_decisions=False,
 ):
@@ -194,7 +195,7 @@ def fixed_q_bid_trading_energy(
 
     daily_l1 = bid_price.abs().sum(dim=-1)
     budget_penalty = torch.zeros_like(base_energy)
-    total_energy = base_energy + penalty_weight * budget_penalty
+    total_energy = base_energy + penalty_weight * budget_penalty 
 
     logs = {
         "mean_payoff": payoff.mean().item(),
