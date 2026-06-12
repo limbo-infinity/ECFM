@@ -28,6 +28,10 @@ def fixed_q_from_spread(spread, q_max):
     return torch.where(spread < 0, positive_q, negative_q)
 
 
+def soft_q_from_spread(spread, q_max, temperature=10.0):
+    return -q_max * torch.tanh(spread / temperature)
+
+
 def project_l1_budget(values, budget, eps=1e-8):
     daily_l1 = values.abs().sum(dim=-1, keepdim=True)
     budget_tensor = torch.as_tensor(

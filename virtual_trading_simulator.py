@@ -10,6 +10,7 @@ from helper import (
     fixed_q_from_spread,
     project_l1_budget,
     q_bid_trading_energy,
+    soft_q_from_spread,
     transform_q_bid_decision,
     transform_x,
 )
@@ -521,6 +522,8 @@ def evaluate_q_bid_policy(
     use_langevin=True,
     langevin_steps=30,
     langevin_step_size=1e-5,
+    use_soft_q=False,
+    q_temperature=10.0,
 ):
     prediction_model.eval()
     ecfm_model.eval()
@@ -759,6 +762,8 @@ def evaluate_fixed_q_bid_policy(
     use_langevin=True,
     langevin_steps=30,
     langevin_step_size=1e-5,
+    use_soft_q=False,
+    q_temperature=10.0,
 ):
     prediction_model.eval()
     ecfm_model.eval()
@@ -791,7 +796,14 @@ def evaluate_fixed_q_bid_policy(
             prediction_output = prediction_model(xi)
             da_pred, rt_pred = prediction_to_price_conditions(prediction_output)
             spread_pred = da_pred - rt_pred
-            q = fixed_q_from_spread(spread_pred, q_max=q_max)
+            if use_soft_q:
+                q = soft_q_from_spread(
+                    spread_pred,
+                    q_max=q_max,
+                    temperature=q_temperature,
+                )
+            else:
+                q = fixed_q_from_spread(spread_pred, q_max=q_max)
             raw_samples = ecfm_model.sample(
                 da_cond=da_pred,
                 rt_cond=rt_pred,
@@ -994,6 +1006,8 @@ def evaluate_direct_bid_policy(
     q_max=1.0,
     alpha=5.0,
     penalty_weight=100.0,
+    use_soft_q=False,
+    q_temperature=10.0,
 ):
     prediction_model.eval()
     bid_model.eval()
@@ -1023,7 +1037,14 @@ def evaluate_direct_bid_policy(
             prediction_output = prediction_model(xi)
             da_pred, rt_pred = prediction_to_price_conditions(prediction_output)
             spread_pred = da_pred - rt_pred
-            q = fixed_q_from_spread(spread_pred, q_max=q_max)
+            if use_soft_q:
+                q = soft_q_from_spread(
+                    spread_pred,
+                    q_max=q_max,
+                    temperature=q_temperature,
+                )
+            else:
+                q = fixed_q_from_spread(spread_pred, q_max=q_max)
             raw_decision = bid_model(da_pred, rt_pred)
             raw_bid_price = transform_x(raw_decision, low=low, up=up)
             bid_price = project_l1_budget(raw_bid_price, budget=budget)

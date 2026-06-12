@@ -1,5 +1,6 @@
 import csv
 import glob
+import math
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -185,7 +186,18 @@ def load_lbmp_csv(
 
 
 class VirtualTradingDataset(Dataset):
-    def __init__(self, da_prices, rt_prices, history_len=30, gap=2, target_indices=None):
+    def __init__(
+        self,
+        da_prices,
+        rt_prices,
+        history_len=30,
+        gap=2,
+        target_indices=None,
+        dates=None,
+        normalize_inputs=False,
+        input_stats=None,
+        include_time_features=False,
+    ):
         """
         da_prices: [num_days, K]
         rt_prices: [num_days, K]
@@ -194,11 +206,32 @@ class VirtualTradingDataset(Dataset):
         self.rt_prices = torch.as_tensor(rt_prices, dtype=torch.float32)
         self.history_len = history_len
         self.gap = gap
+        self.dates = list(dates) if dates is not None else None
+        self.normalize_inputs = normalize_inputs
+        self.include_time_features = include_time_features
 
         if self.da_prices.shape != self.rt_prices.shape:
             raise ValueError("da_prices and rt_prices must have the same shape.")
 
         self.num_days, self.K = self.da_prices.shape
+        if self.dates is not None and len(self.dates) != self.num_days:
+            raise ValueError("dates must have one entry per price row.")
+        if self.include_time_features and self.dates is None:
+            raise ValueError("dates are required when include_time_features=True.")
+
+        self.input_stats = None
+        if self.normalize_inputs:
+            if input_stats is None:
+                raise ValueError("input_stats are required when normalize_inputs=True.")
+            self.input_stats = {
+                "da_mean": torch.as_tensor(input_stats["da_mean"], dtype=torch.float32),
+                "da_std": torch.as_tensor(input_stats["da_std"], dtype=torch.float32),
+                "rt_mean": torch.as_tensor(input_stats["rt_mean"], dtype=torch.float32),
+                "rt_std": torch.as_tensor(input_stats["rt_std"], dtype=torch.float32),
+            }
+
+        self.time_feature_dim = 14 if self.include_time_features else 0
+        self.obs_dim = 2 * history_len * self.K + self.time_feature_dim
         first_valid_t = history_len + gap - 1  ##Not sure if this is right
         
 
@@ -216,6 +249,24 @@ class VirtualTradingDataset(Dataset):
     def __len__(self):
         return len(self.target_indices)
 
+    @staticmethod
+    def date_features(date_value):
+        day_of_week = date_value.weekday()
+        day_of_year = date_value.timetuple().tm_yday
+        month = date_value.month
+        return torch.tensor(
+            [
+                math.sin(2.0 * math.pi * day_of_week / 7.0),
+                math.cos(2.0 * math.pi * day_of_week / 7.0),
+                math.sin(2.0 * math.pi * day_of_year / 366.0),
+                math.cos(2.0 * math.pi * day_of_year / 366.0),
+                math.sin(2.0 * math.pi * (month - 1) / 12.0),
+                math.cos(2.0 * math.pi * (month - 1) / 12.0),
+                1.0 if day_of_week >= 5 else 0.0,
+            ],
+            dtype=torch.float32,
+        )
+
     def __getitem__(self, idx):
         target_day = self.target_indices[idx]
         latest_input_day = target_day - self.gap
@@ -225,12 +276,41 @@ class VirtualTradingDataset(Dataset):
         end = latest_input_day + 1
         hist_da = self.da_prices[start:end]
         hist_rt = self.rt_prices[start:end]
+
+        if self.normalize_inputs:
+            hist_da = (
+                hist_da - self.input_stats["da_mean"]
+            ) / self.input_stats["da_std"]
+            hist_rt = (
+                hist_rt - self.input_stats["rt_mean"]
+            ) / self.input_stats["rt_std"]
         
         xi = torch.cat([hist_da, hist_rt], dim=0).reshape(-1)
+        if self.include_time_features:
+            time_features = torch.cat(
+                [
+                    self.date_features(self.dates[target_day]),
+                    self.date_features(self.dates[latest_input_day]),
+                ],
+                dim=0,
+            )
+            xi = torch.cat([xi, time_features], dim=0)
+
         da_true = self.da_prices[target_day].unsqueeze(0)
         rt_true = self.rt_prices[target_day].unsqueeze(0)
 
         return xi, da_true, rt_true
+
+
+def compute_input_normalization_stats(da_prices, rt_prices, train_days, eps=1e-6):
+    train_da = np.asarray(da_prices[:train_days], dtype=np.float32)
+    train_rt = np.asarray(rt_prices[:train_days], dtype=np.float32)
+    return {
+        "da_mean": train_da.mean(axis=0),
+        "da_std": np.maximum(train_da.std(axis=0), eps),
+        "rt_mean": train_rt.mean(axis=0),
+        "rt_std": np.maximum(train_rt.std(axis=0), eps),
+    }
 
 
 def make_train_val_loaders(
@@ -241,6 +321,9 @@ def make_train_val_loaders(
     batch_size=128,
     train_frac=0.8,
     train_drop_last=False,
+    dates=None,
+    normalize_inputs=False,
+    include_time_features=False,
 ):
     num_days = da_prices.shape[0]
     first_valid_t = history_len + gap - 1
@@ -248,12 +331,23 @@ def make_train_val_loaders(
     train_days = int(train_frac * num_days)
     train_target_days = all_target_days[all_target_days < train_days]
     val_target_days = all_target_days[all_target_days >= train_days]
+    input_stats = None
+    if normalize_inputs:
+        input_stats = compute_input_normalization_stats(
+            da_prices,
+            rt_prices,
+            train_days=train_days,
+        )
     train_dataset = VirtualTradingDataset(
         da_prices=da_prices,
         rt_prices=rt_prices,
         history_len=history_len,
         gap=gap,
         target_indices=train_target_days,
+        dates=dates,
+        normalize_inputs=normalize_inputs,
+        input_stats=input_stats,
+        include_time_features=include_time_features,
     )
     val_dataset = VirtualTradingDataset(
         da_prices=da_prices,
@@ -261,6 +355,10 @@ def make_train_val_loaders(
         history_len=history_len,
         gap=gap,
         target_indices=val_target_days,
+        dates=dates,
+        normalize_inputs=normalize_inputs,
+        input_stats=input_stats,
+        include_time_features=include_time_features,
     )
 
     train_loader = DataLoader(
@@ -287,6 +385,8 @@ def load_train_val_from_csv(
     train_drop_last=False,
     include_trade_sides=False,
     zones=None,
+    normalize_inputs=False,
+    include_time_features=False,
 ):
     da_prices, da_metadata = load_lbmp_csv(
         da_paths,
@@ -311,7 +411,14 @@ def load_train_val_from_csv(
         batch_size=batch_size,
         train_frac=train_frac,
         train_drop_last=train_drop_last,
+        dates=da_metadata["dates"],
+        normalize_inputs=normalize_inputs,
+        include_time_features=include_time_features,
     )
+    da_metadata["normalize_inputs"] = normalize_inputs
+    da_metadata["include_time_features"] = include_time_features
+    da_metadata["time_feature_dim"] = train_loader.dataset.time_feature_dim
+    da_metadata["obs_dim"] = train_loader.dataset.obs_dim
     return train_loader, val_loader, da_metadata
 
 
@@ -354,6 +461,8 @@ def load_train_val_from_zone_data(
     train_drop_last=False,
     include_trade_sides=False,
     zones=NYISO_ZONES,
+    normalize_inputs=False,
+    include_time_features=False,
 ):
     da_prices, rt_prices, metadata = load_prices_from_zone_data(
         zone_data_dir=zone_data_dir,
@@ -368,7 +477,14 @@ def load_train_val_from_zone_data(
         batch_size=batch_size,
         train_frac=train_frac,
         train_drop_last=train_drop_last,
+        dates=metadata["dates"],
+        normalize_inputs=normalize_inputs,
+        include_time_features=include_time_features,
     )
+    metadata["normalize_inputs"] = normalize_inputs
+    metadata["include_time_features"] = include_time_features
+    metadata["time_feature_dim"] = train_loader.dataset.time_feature_dim
+    metadata["obs_dim"] = train_loader.dataset.obs_dim
     return train_loader, val_loader, metadata
 
 
