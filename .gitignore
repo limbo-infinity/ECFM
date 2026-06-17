@@ -15,3 +15,8 @@ zone_data/RT/
 zone_data/_zip_cache/
 experiments/
 *.png
+
+# Local stock-market research/trading scripts, data, and generated tickets.
+stock_market_algorithms/
+market_data/
+trade_tickets/

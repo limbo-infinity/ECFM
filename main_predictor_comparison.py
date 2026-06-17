@@ -980,8 +980,8 @@ if __name__ == "__main__":
     alpha = 5.0
     penalty_weight = 1.0
     q_max = 1.0
-    budget = 250000.0
-    bid_low = -1000.0
+    budget = 250000
+    bid_low = -1000
     bid_up = 2000.0
 
     train_loader, val_loader, metadata = load_train_val_from_zone_data(
